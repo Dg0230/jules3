@@ -1,36 +1,15 @@
-package store
+package sqlite
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
-	"time"
+
+	"excel-translator/pkg/domain"
 
 	_ "modernc.org/sqlite"
 )
-
-type TaskStatus string
-
-const (
-	StatusPending  TaskStatus = "PENDING"
-	StatusProcessing TaskStatus = "PROCESSING"
-	StatusComplete TaskStatus = "COMPLETE"
-	StatusFailed   TaskStatus = "FAILED"
-)
-
-type Task struct {
-	ID             int64
-	JobID          string
-	RowIndex       int
-	SourceContent  string
-	TargetLang     string
-	TranslatedText string
-	Status         TaskStatus
-	ErrorMessage   string
-	Attempts       int
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-}
 
 type Store struct {
 	db *sql.DB
@@ -43,18 +22,21 @@ func NewStore(dbPath string) (*Store, error) {
 	}
 
 	s := &Store{db: db}
-	if err := s.init(); err != nil {
+	if err := s.Init(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
+// Ensure Store implements domain.TaskRepository
+var _ domain.TaskRepository = (*Store)(nil)
+
 func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) init() error {
+func (s *Store) Init() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS tasks (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,14 +57,14 @@ func (s *Store) init() error {
 	return err
 }
 
-func (s *Store) AddTasks(tasks []Task) error {
-	tx, err := s.db.Begin()
+func (s *Store) AddTasks(ctx context.Context, tasks []domain.Task) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`
+	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO tasks (job_id, row_index, source_content, target_lang, status)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(job_id, row_index, target_lang) DO NOTHING
@@ -93,7 +75,7 @@ func (s *Store) AddTasks(tasks []Task) error {
 	defer stmt.Close()
 
 	for _, task := range tasks {
-		_, err := stmt.Exec(task.JobID, task.RowIndex, task.SourceContent, task.TargetLang, StatusPending)
+		_, err := stmt.ExecContext(ctx, task.JobID, task.RowIndex, task.SourceContent, task.TargetLang, domain.StatusPending)
 		if err != nil {
 			return err
 		}
@@ -102,7 +84,7 @@ func (s *Store) AddTasks(tasks []Task) error {
 	return tx.Commit()
 }
 
-func (s *Store) GetPendingTasks(jobID string, limit int) ([]Task, error) {
+func (s *Store) GetPendingTasks(ctx context.Context, jobID string, limit int) ([]domain.Task, error) {
 	query := `
 		SELECT id, row_index, source_content, target_lang, attempts
 		FROM tasks
@@ -110,15 +92,15 @@ func (s *Store) GetPendingTasks(jobID string, limit int) ([]Task, error) {
 		ORDER BY id ASC
 		LIMIT ?
 	`
-	rows, err := s.db.Query(query, jobID, limit)
+	rows, err := s.db.QueryContext(ctx, query, jobID, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var tasks []Task
+	var tasks []domain.Task
 	for rows.Next() {
-		var t Task
+		var t domain.Task
 		if err := rows.Scan(&t.ID, &t.RowIndex, &t.SourceContent, &t.TargetLang, &t.Attempts); err != nil {
 			return nil, err
 		}
@@ -127,12 +109,11 @@ func (s *Store) GetPendingTasks(jobID string, limit int) ([]Task, error) {
 	return tasks, nil
 }
 
-func (s *Store) MarkProcessing(taskIDs []int64) error {
+func (s *Store) MarkProcessing(ctx context.Context, taskIDs []int64) error {
 	if len(taskIDs) == 0 {
 		return nil
 	}
 
-	// Build query manually for IN clause
 	args := make([]interface{}, len(taskIDs))
 	for i, id := range taskIDs {
 		args[i] = id
@@ -143,21 +124,20 @@ func (s *Store) MarkProcessing(taskIDs []int64) error {
 
 	query := fmt.Sprintf("UPDATE tasks SET status = ?, attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP WHERE id IN (%s)", placeholders)
 
-	// Add status as first arg
-	finalArgs := append([]interface{}{StatusProcessing}, args...)
+	finalArgs := append([]interface{}{domain.StatusProcessing}, args...)
 
-	_, err := s.db.Exec(query, finalArgs...)
+	_, err := s.db.ExecContext(ctx, query, finalArgs...)
 	return err
 }
 
-func (s *Store) MarkComplete(tasks []Task) error {
-	tx, err := s.db.Begin()
+func (s *Store) MarkComplete(ctx context.Context, tasks []domain.Task) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`
+	stmt, err := tx.PrepareContext(ctx, `
 		UPDATE tasks
 		SET status = ?, translated_text = ?, error_message = NULL, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?
@@ -168,7 +148,7 @@ func (s *Store) MarkComplete(tasks []Task) error {
 	defer stmt.Close()
 
 	for _, t := range tasks {
-		_, err := stmt.Exec(StatusComplete, t.TranslatedText, t.ID)
+		_, err := stmt.ExecContext(ctx, domain.StatusComplete, t.TranslatedText, t.ID)
 		if err != nil {
 			return err
 		}
@@ -177,7 +157,7 @@ func (s *Store) MarkComplete(tasks []Task) error {
 	return tx.Commit()
 }
 
-func (s *Store) MarkFailed(taskIDs []int64, errMsg string) error {
+func (s *Store) MarkFailed(ctx context.Context, taskIDs []int64, errMsg string) error {
 	if len(taskIDs) == 0 {
 		return nil
 	}
@@ -192,37 +172,31 @@ func (s *Store) MarkFailed(taskIDs []int64, errMsg string) error {
 
 	query := fmt.Sprintf("UPDATE tasks SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id IN (%s)", placeholders)
 
-	finalArgs := append([]interface{}{StatusFailed, errMsg}, args...)
+	finalArgs := append([]interface{}{domain.StatusFailed, errMsg}, args...)
 
-	_, err := s.db.Exec(query, finalArgs...)
+	_, err := s.db.ExecContext(ctx, query, finalArgs...)
 	return err
 }
 
-func (s *Store) GetCompletedTasks(jobID string) ([]Task, error) {
+func (s *Store) GetCompletedTasks(ctx context.Context, jobID string) ([]domain.Task, error) {
 	query := `
 		SELECT row_index, target_lang, translated_text
 		FROM tasks
 		WHERE job_id = ? AND status = 'COMPLETE'
 	`
-	rows, err := s.db.Query(query, jobID)
+	rows, err := s.db.QueryContext(ctx, query, jobID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var tasks []Task
+	var tasks []domain.Task
 	for rows.Next() {
-		var t Task
+		var t domain.Task
 		if err := rows.Scan(&t.RowIndex, &t.TargetLang, &t.TranslatedText); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
 	}
 	return tasks, nil
-}
-
-func (s *Store) GetTotalPendingCount() (int, error) {
-	var count int
-	err := s.db.QueryRow("SELECT count(*) FROM tasks WHERE status IN ('PENDING', 'FAILED') AND attempts < 5").Scan(&count)
-	return count, err
 }

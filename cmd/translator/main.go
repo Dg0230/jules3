@@ -3,11 +3,13 @@ package main
 import (
 	"log"
 	"os"
+	"context"
 	"strconv"
 
-	"excel-translator/pkg/llm"
-	"excel-translator/pkg/store"
-	"excel-translator/pkg/translator"
+	"excel-translator/pkg/adapter/doubao"
+	"excel-translator/pkg/adapter/excel"
+	"excel-translator/pkg/adapter/sqlite"
+	"excel-translator/pkg/service"
 
 	"github.com/joho/godotenv"
 )
@@ -37,17 +39,21 @@ func main() {
 
 	log.Printf("Starting translator with RPM limit: %d", rpm)
 
-	// Initialize DB
+	// 1. Initialize Adapters
 	dbPath := "translation.db"
-	s, err := store.NewStore(dbPath)
+	repo, err := sqlite.NewStore(dbPath)
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
-	defer s.Close()
+	defer repo.Close()
 
-	client := llm.NewClient(apiKey, endpointID, apiURL, rpm)
-	proc := translator.NewProcessor(client, s)
+	translator := doubao.NewClient(apiKey, endpointID, apiURL, rpm)
+	excelAdapter := excel.NewAdapter()
 
+	// 2. Initialize Service
+	engine := service.NewTranslationEngine(translator, repo)
+
+	// 3. CLI Logic
 	inputFile := "sample.xlsx"
 	if len(os.Args) > 1 {
 		inputFile = os.Args[1]
@@ -58,9 +64,34 @@ func main() {
 		outputFile = os.Args[2]
 	}
 
+	ctx := context.Background()
 	log.Printf("Processing %s -> %s", inputFile, outputFile)
-	if err := proc.ProcessFile(inputFile, outputFile); err != nil {
-		log.Fatalf("Processing failed: %v", err)
+
+	// Step A: Read & Ingest
+	jobID, tasks, err := excelAdapter.ReadRawRows(inputFile)
+	if err != nil {
+		log.Fatalf("Failed to read input: %v", err)
+	}
+	log.Printf("Job ID: %s. Found %d potential translation tasks.", jobID, len(tasks))
+
+	if err := engine.Ingest(ctx, tasks); err != nil {
+		log.Fatalf("Failed to ingest tasks: %v", err)
+	}
+
+	// Step B: Process
+	if err := engine.RunLoop(ctx, jobID); err != nil {
+		log.Fatalf("Processing loop failed: %v", err)
+	}
+
+	// Step C: Export
+	completedTasks, err := engine.GetResults(ctx, jobID)
+	if err != nil {
+		log.Fatalf("Failed to get results: %v", err)
+	}
+	log.Printf("Retrieved %d completed tasks.", len(completedTasks))
+
+	if err := excelAdapter.WriteResults(inputFile, outputFile, completedTasks); err != nil {
+		log.Fatalf("Failed to write output: %v", err)
 	}
 
 	log.Println("Translation complete!")
