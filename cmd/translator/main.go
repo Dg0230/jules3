@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"excel-translator/pkg/llm"
+	"excel-translator/pkg/store"
 	"excel-translator/pkg/translator"
 
 	"github.com/joho/godotenv"
@@ -36,8 +37,16 @@ func main() {
 
 	log.Printf("Starting translator with RPM limit: %d", rpm)
 
+	// Initialize DB
+	dbPath := "translation.db"
+	s, err := store.NewStore(dbPath)
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+	defer s.Close()
+
 	client := llm.NewClient(apiKey, endpointID, apiURL, rpm)
-	proc := translator.NewProcessor(client)
+	proc := translator.NewProcessor(client, s)
 
 	inputFile := "sample.xlsx"
 	if len(os.Args) > 1 {
