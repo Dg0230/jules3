@@ -43,19 +43,29 @@ func (a *Adapter) ReadRawRows(path string) (jobID string, tasks []domain.Task, e
 	}
 
 	headerMap := make(map[string]int)
+	var targets []string
+	var keyFound, chFound bool
+	var chIndex int
+
 	for i, cell := range rows[0] {
 		headerMap[cell] = i
-	}
-
-	requiredHeaders := []string{"key", "CH", "FR", "PT"}
-	for _, h := range requiredHeaders {
-		if _, ok := headerMap[h]; !ok {
-			return "", nil, fmt.Errorf("missing header: %s", h)
+		if cell == "key" {
+			keyFound = true
+		} else if cell == "CH" {
+			chFound = true
+			chIndex = i
+		} else {
+			// Assume any other column is a target language
+			targets = append(targets, cell)
 		}
 	}
 
-	chIndex := headerMap["CH"]
-	targets := []string{"FR", "PT"}
+	if !keyFound {
+		return "", nil, fmt.Errorf("missing required header: key")
+	}
+	if !chFound {
+		return "", nil, fmt.Errorf("missing required header: CH")
+	}
 
 	for i := 1; i < len(rows); i++ {
 		row := rows[i]
