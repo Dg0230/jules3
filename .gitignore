@@ -2,4 +2,4 @@
 .env
 *.db
 *.db-journal
-translator
+/translator
